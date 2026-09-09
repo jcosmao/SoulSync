@@ -1,5 +1,7 @@
 import requests
 import asyncio
+import contextvars
+import random
 import aiohttp
 import os
 from typing import List, Optional, Dict, Any
@@ -29,6 +31,27 @@ from core.quality.source_map import AUDIO_EXTENSIONS, format_from_extension
 from utils.async_helpers import run_async
 
 logger = get_logger("soulseek_client")
+
+
+# Set when _make_request sees slskd refuse a search creation, read by
+# _create_search. A ContextVar rather than an attribute: one client instance
+# serves several searches at once, and an attribute would let them overwrite
+# each other's result.
+_search_create_refused: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "slskd_search_create_refused", default=False)
+
+# A refusal clears as soon as the previous request completes, so these are
+# short: four retries over about six seconds.
+_SEARCH_CREATE_RETRIES = 4
+_SEARCH_CREATE_BACKOFF = 0.4
+
+
+class SlskdSearchRefused(RuntimeError):
+    """slskd would not create the search, so nothing was searched.
+
+    Distinct from a search that ran and matched nothing: a caller must not
+    report this as the track being unavailable.
+    """
 
 
 # slskd HTTP timeouts. Issue #499: long-running download sessions
@@ -216,6 +239,10 @@ class SoulseekClient(DownloadSourcePlugin):
                             # slskd's search-creation rate limit — cool the SHARED
                             # (music + video) budget so both sides back off together.
                             slskd_throttle.note_rate_limited(response.headers.get('Retry-After'))
+                            # _make_request returns None for every failure; this
+                            # is how _create_search tells a refusal worth
+                            # retrying from a 400 that never will be.
+                            _search_create_refused.set(True)
                         self._last_401_logged = False
                         logger.error(f"API request failed: HTTP {response.status} ({response.reason}) - {error_detail}")
                         logger.debug(f"Failed request: {method} {url}")
@@ -586,9 +613,43 @@ class SoulseekClient(DownloadSourcePlugin):
         if timeout is None:
             timeout = config_manager.get('soulseek.search_timeout', 60)
 
-        # Apply rate limiting before search
-        await self._wait_for_rate_limit()
+        async with slskd_throttle.searching():
+            # Rate limiting applies inside the gate: a search waiting its turn
+            # must not reserve a creation slot it cannot use yet.
+            await self._wait_for_rate_limit()
+            return await self._run_search(query, timeout, progress_callback)
 
+    async def _create_search(self, search_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """POST the search, retrying while slskd refuses it.
+
+        With the in-flight gate this should be rare, but the video downloader
+        shares this slskd without sharing the gate. A refusal clears as soon as
+        the previous request finishes, so the waits are short.
+        """
+        for attempt in range(_SEARCH_CREATE_RETRIES + 1):
+            _search_create_refused.set(False)
+            response = await self._make_request('POST', 'searches', json=search_data)
+            if response:
+                return response
+            if not _search_create_refused.get():
+                return None          # a real failure; unchanged behaviour
+            if attempt == _SEARCH_CREATE_RETRIES:
+                break
+            delay = min(_SEARCH_CREATE_BACKOFF * (2 ** attempt), 5.0)
+            # Jitter, or every refused caller retries in lockstep and collides again.
+            delay *= 0.5 + random.random() / 2
+            logger.info("slskd refused search creation (attempt %d/%d); retrying in %.1fs",
+                        attempt + 1, _SEARCH_CREATE_RETRIES + 1, delay)
+            await asyncio.sleep(delay)
+        raise SlskdSearchRefused(
+            f"slskd refused to create the search after {_SEARCH_CREATE_RETRIES + 1} attempts "
+            "(only one concurrent operation is permitted) — nothing was searched"
+        )
+
+    async def _run_search(self, query: str, timeout: int,
+                          progress_callback=None) -> tuple[List[TrackResult], List[AlbumResult]]:
+        """The search itself; `search` holds the in-flight gate around it."""
+        from core.settings import config_manager
         try:
             logger.info(f"Starting search for: '{query}' (slskd timeout: {timeout}s)")
 
@@ -607,7 +668,7 @@ class SoulseekClient(DownloadSourcePlugin):
             logger.debug(f"Search data: {search_data}")
             logger.debug(f"Making POST request to: {self.base_url}/api/v0/searches")
             
-            response = await self._make_request('POST', 'searches', json=search_data)
+            response = await self._create_search(search_data)
             if not response:
                 logger.error("No response from search POST request")
                 return [], []
@@ -712,6 +773,11 @@ class SoulseekClient(DownloadSourcePlugin):
             logger.info(f"Search completed. Final results: {len(all_tracks)} tracks and {len(all_albums)} albums for query: {query}")
             return all_tracks, all_albums
             
+        except SlskdSearchRefused:
+            # Not an empty result — the search was never created. Letting it out
+            # is the only way the caller can say so instead of reporting the
+            # track as missing.
+            raise
         except Exception as e:
             logger.error(f"Error searching: {e}")
             return [], []

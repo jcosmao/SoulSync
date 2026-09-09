@@ -25,14 +25,42 @@ wall.
 
 from __future__ import annotations
 
+import asyncio
 import threading
 import time
+from contextlib import asynccontextmanager
 from typing import Any, Dict
 
 MAX_PER_WINDOW = 35
 WINDOW_SECONDS = 220.0
 
+# How many searches may be *in flight* at once, which is a different limit from
+# how fast they may be created.
+#
+# slskd permits one concurrent API operation and refuses the rest with
+# "Only one concurrent operation is permitted"; beyond that it cannot carry many
+# searches on the network at the same time either, and the losers come back
+# empty. Six queries that each return results when run alone, fired together:
+#
+#     in flight   returning results   silent empties   wall
+#     unbounded        2/6                  4           --
+#     1                5/6                  1          133 s
+#     2                6/6                  0           52 s
+#     3                5/6                  1           47 s
+#
+# 2 is the only setting that lost nothing, and it is 2.5x faster than serial --
+# which matters beyond throughput, since `soulseek.download_timeout` fails any
+# task still in `searching` and a slowly draining queue turns into "Search stuck
+# for 10 minutes with no results" on the tasks at the back.
+MAX_IN_FLIGHT = 2
+
+# How often a waiter retries the gate. Invisible next to a 20-35 s search.
+ACQUIRE_POLL_SECONDS = 0.25
+
 _LOCK = threading.Lock()
+# A threading primitive, not an asyncio one: SoulSync runs several event loops
+# in worker threads and an asyncio.Semaphore would only gate one of them.
+_IN_FLIGHT = threading.BoundedSemaphore(MAX_IN_FLIGHT)
 _TIMES: list = []          # reserved creation times (monotonic), pruned to the window
 _COOLDOWN_UNTIL = [0.0]
 
@@ -63,6 +91,24 @@ def reserve_search_slot(min_gap_seconds: float = 0.0,
         return at
 
 
+@asynccontextmanager
+async def searching():
+    """Hold one of the in-flight search slots for the duration of a search.
+
+    Waits with a non-blocking acquire polled from `asyncio.sleep`, never
+    `run_in_executor(None, acquire)`: that would park a thread of the default
+    executor for the whole wait, and aiohttp resolves DNS on the same executor,
+    so a queue of waiting searches starves it and unrelated slskd calls start
+    timing out.
+    """
+    while not _IN_FLIGHT.acquire(blocking=False):
+        await asyncio.sleep(ACQUIRE_POLL_SECONDS)
+    try:
+        yield
+    finally:
+        _IN_FLIGHT.release()
+
+
 def note_rate_limited(retry_after: Any = None) -> None:
     """slskd returned 429 — every caller backs off before the next search."""
     try:
@@ -84,6 +130,7 @@ def status() -> Dict[str, Any]:
         'max_searches_per_window': MAX_PER_WINDOW,
         'window_seconds': WINDOW_SECONDS,
         'searches_remaining': max(0, MAX_PER_WINDOW - used),
+        'max_searches_in_flight': MAX_IN_FLIGHT,
     }
 
 
