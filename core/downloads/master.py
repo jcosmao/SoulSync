@@ -202,6 +202,39 @@ def _album_context_richness(album_ctx: dict) -> int:
     return score
 
 
+# No release is this many files. A folder past it is a share, a genre dump or a
+# DJ's edit collection, whatever the metadata says.
+_MAX_RELEASE_FOLDER_TRACKS = 300
+
+
+def _folder_is_plausible_release(folder_track_count: int, expected_count: int,
+                                 matched_count: int) -> bool:
+    """Is a browsed folder small enough to be the release we are after?
+
+    The candidate is scored on what the *search* returned, then everything the
+    *browse* returns is downloaded, and nothing used to compare the two. A
+    folder that offered five matching tracks turned out to hold 36,377 files --
+    a peer's whole collection of DJ edits, in which five tracks of the release
+    happened to live -- and all of it was enqueued.
+
+    `expected_count` is the release's track count from the source metadata,
+    which is the number worth trusting. When it is missing, what the search
+    matched in that folder is the only expectation available.
+
+    The slack is deliberately wide: multi-disc sets, bonus discs and hidden
+    tracks all push a folder past its nominal track count, and refusing a real
+    release costs more than accepting a slightly untidy one.
+    """
+    if folder_track_count <= 0:
+        return True                      # nothing to guard; handled upstream
+    if folder_track_count > _MAX_RELEASE_FOLDER_TRACKS:
+        return False
+    expected = expected_count if expected_count > 0 else matched_count
+    if expected <= 0:
+        return True                      # no expectation to measure against
+    return folder_track_count <= max(3 * expected, expected + 10)
+
+
 def _score_album_folder(album_result: Any, album_context: dict, artist_context: dict,
                         tracks_json: list[dict], filtered_track_count: int) -> float:
     """Score one slskd folder as a whole release, not as isolated tracks."""
@@ -1167,6 +1200,30 @@ def run_full_missing_tracks_process(batch_id, playlist_id, tracks_json, deps: Ma
                                 folder_tracks = slsk.parse_browse_results_to_tracks(
                                     best_album.username, browse_files, directory=best_album.album_path
                                 )
+                                # The browse can reveal that the "album folder" is
+                                # nothing of the kind. Treat that as a failed browse:
+                                # the fallback below keeps the tracks the search
+                                # actually matched, instead of the peer's whole share.
+                                _expected_tracks = int((batch_album_context or {}).get('total_tracks') or 0)
+                                _matched_tracks = int(getattr(best_album, 'track_count', 0)
+                                                      or len(getattr(best_album, 'tracks', None) or []))
+                                if folder_tracks and not _folder_is_plausible_release(
+                                        len(folder_tracks), _expected_tracks, _matched_tracks):
+                                    _sr.info(
+                                        f"[Album Pre-flight] {best_album.username}:{best_album.album_path} "
+                                        f"holds {len(folder_tracks)} tracks against an expected "
+                                        f"{_expected_tracks or _matched_tracks or '?'} — not one release; "
+                                        f"keeping only what the search matched"
+                                    )
+                                    logger.warning(
+                                        f"[Album Pre-flight] Folder {best_album.album_path} has "
+                                        f"{len(folder_tracks)} tracks, far more than the release's "
+                                        f"{_expected_tracks or _matched_tracks or 'unknown'} — using the "
+                                        f"search results instead of the whole folder"
+                                    )
+                                    browse_files = None
+                                    folder_tracks = []
+                            if browse_files:
                                 if folder_tracks:
                                     preflight_source = {
                                         'username': best_album.username,
