@@ -780,6 +780,15 @@ class ImageCache:
         conn = sqlite3.connect(self.db_path, timeout=10.0)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA busy_timeout = 10000")
+        # synchronous is per-connection, unlike journal_mode, so setting it
+        # once in _init_db only covers that one connection. Every other one
+        # commits at the default FULL: an fsync per commit, serialized behind
+        # the cache lock. NORMAL is only the documented-safe trade under WAL
+        # (an OS crash loses recent commits, never corrupts), so check the
+        # mode this connection actually landed in.
+        journal_mode = conn.execute("PRAGMA journal_mode").fetchone()
+        if journal_mode and str(journal_mode[0]).lower() == "wal":
+            conn.execute("PRAGMA synchronous = NORMAL")
         return conn
 
     @contextmanager

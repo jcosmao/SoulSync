@@ -477,8 +477,13 @@ class VideoDatabase:
         conn = sqlite3.connect(str(self.database_path), timeout=30.0)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON")
-        conn.execute("PRAGMA journal_mode = WAL")
+        journal_mode = conn.execute("PRAGMA journal_mode = WAL").fetchone()
         conn.execute("PRAGMA busy_timeout = 30000")  # 30s
+        # synchronous is per-connection, unlike journal_mode. NORMAL is only
+        # the documented-safe trade under WAL, so apply it only when the
+        # switch to WAL actually took.
+        if journal_mode and str(journal_mode[0]).lower() == "wal":
+            conn.execute("PRAGMA synchronous = NORMAL")
         return conn
 
     def connect(self) -> sqlite3.Connection:
